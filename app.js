@@ -1,0 +1,708 @@
+// Initialize Telegram WebApp
+const tg = window.Telegram?.WebApp;
+if (tg) {
+    tg.ready();
+    tg.expand();
+}
+
+// Determine API Base URL (reads from ?api_url= parameter or window.API_BASE_URL)
+const urlParams = new URLSearchParams(window.location.search);
+const API_BASE_URL = (urlParams.get('api_url') || window.API_BASE_URL || '').replace(/\/+$/, '');
+
+// UI Elements
+const screenRecorder = document.getElementById('recorder-screen');
+const screenProcessing = document.getElementById('processing-screen');
+const screenResult = document.getElementById('result-screen');
+
+const statusBadge = document.getElementById('status-badge');
+const statusText = document.getElementById('status-text');
+const timerDisplay = document.getElementById('timer-display');
+const canvas = document.getElementById('waveform-canvas');
+const canvasCtx = canvas.getContext('2d');
+
+const recordCore = document.getElementById('record-core');
+const btnRecord = document.getElementById('btn-record');
+const btnStop = document.getElementById('btn-stop');
+const iconPause = document.getElementById('icon-pause');
+const iconPlay = document.getElementById('icon-play');
+
+const btnBack = document.getElementById('btn-back');
+const btnCopy = document.getElementById('btn-copy');
+const transcriptBox = document.getElementById('transcript-box');
+
+const btnSummary = document.getElementById('btn-summary');
+const btnCustomQ = document.getElementById('btn-custom-q');
+const aiCard = document.getElementById('ai-response-card');
+const aiCardTitle = document.getElementById('ai-card-title');
+const aiCardBody = document.getElementById('ai-card-body');
+const btnCloseAi = document.getElementById('btn-close-ai');
+
+const questionModal = document.getElementById('question-modal');
+const inputCustomQuestion = document.getElementById('input-custom-question');
+const btnCancelQ = document.getElementById('btn-cancel-q');
+const btnSendQ = document.getElementById('btn-send-q');
+
+// Recording State
+let mediaRecorder = null;
+let audioChunks = [];
+let recordingInterval = null;
+let startTime = 0;
+let elapsedTime = 0;
+let isPaused = false;
+let wakeLock = null;
+
+// Audio Context & Visualizer State
+let audioCtx = null;
+let analyser = null;
+let dataArray = null;
+let animationFrameId = null;
+let activeStream = null;
+let smoothedHeights = [];
+const NUM_VISUALIZER_BARS = 32;
+
+// Current Transcript State
+let currentTranscript = '';
+
+// Task Queue State
+let trackedJobs = [];
+let pollingIntervalId = null;
+let recordingCounter = 0;
+
+// Screen Navigation
+function showScreen(screen) {
+    [screenRecorder, screenProcessing, screenResult].forEach(s => s?.classList.remove('active'));
+    screen?.classList.add('active');
+}
+
+// Screen Wake Lock
+async function requestWakeLock() {
+    try {
+        if ('wakeLock' in navigator) {
+            wakeLock = await navigator.wakeLock.request('screen');
+        }
+    } catch (err) {
+        console.warn('Wake Lock request failed:', err);
+    }
+}
+
+function releaseWakeLock() {
+    if (wakeLock) {
+        wakeLock.release().catch(() => {});
+        wakeLock = null;
+    }
+}
+
+// Timer
+function startTimer() {
+    startTime = Date.now() - elapsedTime;
+    recordingInterval = setInterval(() => {
+        elapsedTime = Date.now() - startTime;
+        updateTimerDisplay(elapsedTime);
+    }, 1000);
+}
+
+function stopTimer() {
+    if (recordingInterval) {
+        clearInterval(recordingInterval);
+        recordingInterval = null;
+    }
+}
+
+function resetTimer() {
+    stopTimer();
+    elapsedTime = 0;
+    if (timerDisplay) timerDisplay.innerText = '00:00';
+}
+
+function updateTimerDisplay(ms) {
+    const totalSeconds = Math.floor(ms / 1000);
+    const mins = Math.floor(totalSeconds / 60);
+    const secs = totalSeconds % 60;
+    if (timerDisplay) {
+        timerDisplay.innerText = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+    }
+}
+
+// Audio Visualizer
+async function setupAudioVisualizer(stream) {
+    try {
+        if (!audioCtx) {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (audioCtx.state === 'suspended') {
+            await audioCtx.resume();
+        }
+
+        analyser = audioCtx.createAnalyser();
+        const source = audioCtx.createMediaStreamSource(stream);
+        source.connect(analyser);
+
+        analyser.fftSize = 128;
+        analyser.smoothingTimeConstant = 0.8;
+        const bufferLength = analyser.frequencyBinCount;
+        dataArray = new Uint8Array(bufferLength);
+
+        smoothedHeights = new Array(NUM_VISUALIZER_BARS).fill(6);
+        resizeCanvas();
+    } catch (err) {
+        console.warn('Audio visualizer setup error:', err);
+    }
+}
+
+function stopAudioVisualizer() {
+    analyser = null;
+    dataArray = null;
+}
+
+function resizeCanvas() {
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) {
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+    }
+}
+
+function drawWaveform() {
+    animationFrameId = requestAnimationFrame(drawWaveform);
+    if (!canvas || !canvasCtx) return;
+
+    const width = canvas.width;
+    const height = canvas.height;
+    if (width === 0 || height === 0) return;
+
+    canvasCtx.clearRect(0, 0, width, height);
+
+    const isRecording = mediaRecorder && mediaRecorder.state === 'recording';
+    const numBars = NUM_VISUALIZER_BARS;
+    const totalGapRatio = 0.35;
+    const barWidth = (width / numBars) * (1 - totalGapRatio);
+    const gap = (width / numBars) * totalGapRatio;
+
+    if (isRecording && analyser && dataArray) {
+        analyser.getByteFrequencyData(dataArray);
+    }
+
+    const time = Date.now() * 0.003;
+
+    for (let i = 0; i < numBars; i++) {
+        let targetH = 6;
+        if (isRecording && dataArray) {
+            const sampleIdx = Math.floor((i / numBars) * Math.min(dataArray.length, 48));
+            const val = dataArray[sampleIdx] || 0;
+            targetH = Math.max(6, (val / 255) * (height * 0.85));
+        } else if (isPaused) {
+            targetH = 6;
+        } else {
+            // Ambient idle wave animation so container is never empty square
+            const sine = Math.sin(time + i * 0.25);
+            const cosine = Math.cos(time * 0.7 + i * 0.15);
+            targetH = 8 + (sine + cosine) * 3;
+        }
+
+        if (!smoothedHeights[i]) smoothedHeights[i] = 6;
+        smoothedHeights[i] = smoothedHeights[i] * 0.65 + targetH * 0.35;
+        const currentH = smoothedHeights[i];
+
+        const x = i * (barWidth + gap) + gap / 2;
+        const y = (height - currentH) / 2;
+        const radius = Math.min(barWidth / 2, currentH / 2);
+
+        const gradient = canvasCtx.createLinearGradient(0, y, 0, y + currentH);
+        if (isRecording) {
+            gradient.addColorStop(0, '#60a5fa');
+            gradient.addColorStop(0.5, '#3b82f6');
+            gradient.addColorStop(1, '#8b5cf6');
+        } else if (isPaused) {
+            gradient.addColorStop(0, '#fbbf24');
+            gradient.addColorStop(1, '#f59e0b');
+        } else {
+            // Soft ambient wave colors when waiting/idle
+            gradient.addColorStop(0, 'rgba(96, 165, 250, 0.45)');
+            gradient.addColorStop(1, 'rgba(139, 92, 246, 0.25)');
+        }
+
+        canvasCtx.fillStyle = gradient;
+        canvasCtx.beginPath();
+        if (canvasCtx.roundRect) {
+            canvasCtx.roundRect(x, y, barWidth, currentH, radius);
+        } else {
+            canvasCtx.rect(x, y, barWidth, currentH);
+        }
+        canvasCtx.fill();
+    }
+}
+
+// Audio Stream Acquisition with Multi-Level Progressive Hardware Fallback
+async function getAudioStream() {
+    if (activeStream && activeStream.active && activeStream.getAudioTracks().some(t => t.readyState === 'live')) {
+        return activeStream;
+    }
+
+    const constraintTiers = [
+        // Tier 1: Optimal 48kHz High-Quality Voice Constraints
+        {
+            audio: {
+                echoCancellation: { ideal: true },
+                noiseSuppression: { ideal: true },
+                autoGainControl: { ideal: true },
+                channelCount: { ideal: 1 },
+                sampleRate: { ideal: 48000 }
+            }
+        },
+        // Tier 2: Standard Voice Enhancements (Noise suppression & Echo cancellation)
+        {
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true
+            }
+        },
+        // Tier 3: Basic Hardware Audio Default Fallback
+        { audio: true }
+    ];
+
+    for (const constraints of constraintTiers) {
+        try {
+            activeStream = await navigator.mediaDevices.getUserMedia(constraints);
+            return activeStream;
+        } catch (err) {
+            console.warn('Microphone constraint tier unavailable, trying fallback:', err);
+        }
+    }
+
+    throw new Error('Unable to access microphone on this device.');
+}
+
+function releaseAudioStream() {
+    if (activeStream) {
+        activeStream.getTracks().forEach(track => track.stop());
+        activeStream = null;
+    }
+}
+
+window.addEventListener('beforeunload', releaseAudioStream);
+
+// Helper to create MediaRecorder with adaptive bitrate fallback for mobile compatibility
+function createMediaRecorder(stream) {
+    const candidateMimeTypes = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/mp4',
+        'audio/aac',
+        'audio/ogg',
+        ''
+    ];
+
+    let supportedMime = candidateMimeTypes.find(type => !type || MediaRecorder.isTypeSupported(type)) || '';
+
+    // Bitrate & option candidate tiers
+    const optionTiers = [];
+    if (supportedMime) {
+        optionTiers.push({ mimeType: supportedMime, audioBitsPerSecond: 128000 });
+        optionTiers.push({ mimeType: supportedMime, audioBitsPerSecond: 64000 });
+        optionTiers.push({ mimeType: supportedMime });
+    }
+    optionTiers.push({}); // Browser native default fallback
+
+    for (const opts of optionTiers) {
+        try {
+            return new MediaRecorder(stream, opts);
+        } catch (err) {
+            console.warn('MediaRecorder option tier unavailable, trying fallback:', err);
+        }
+    }
+
+    return new MediaRecorder(stream);
+}
+
+// Start Recording
+async function startRecording() {
+    try {
+        const stream = await getAudioStream();
+
+        mediaRecorder = createMediaRecorder(stream);
+        audioChunks = [];
+
+        mediaRecorder.ondataavailable = (event) => {
+            if (event.data.size > 0) {
+                audioChunks.push(event.data);
+            }
+        };
+
+        mediaRecorder.onstop = () => {
+            // Keep persistentStream active to avoid re-requesting mic permission on next record!
+            stopAudioVisualizer();
+            releaseWakeLock();
+        };
+
+        mediaRecorder.start(1000);
+        await requestWakeLock();
+        await setupAudioVisualizer(stream);
+
+        isPaused = false;
+        startTimer();
+
+        // UI Updates
+        btnRecord.classList.add('recording');
+        if (recordCore) recordCore.classList.add('hidden');
+        iconPause.classList.remove('hidden');
+        iconPlay.classList.add('hidden');
+        btnStop.classList.remove('hidden');
+
+        statusBadge.className = 'status-badge recording';
+        statusText.innerText = 'Recording...';
+
+    } catch (err) {
+        alert('Failed to access microphone: ' + err.message);
+    }
+}
+
+// Pause / Resume Recording
+function togglePause() {
+    if (!mediaRecorder) return;
+
+    if (!isPaused) {
+        mediaRecorder.pause();
+        stopTimer();
+        isPaused = true;
+
+        iconPause.classList.add('hidden');
+        iconPlay.classList.remove('hidden');
+
+        statusBadge.className = 'status-badge paused';
+        statusText.innerText = 'Paused';
+    } else {
+        mediaRecorder.resume();
+        startTimer();
+        isPaused = false;
+
+        iconPause.classList.remove('hidden');
+        iconPlay.classList.add('hidden');
+
+        statusBadge.className = 'status-badge recording';
+        statusText.innerText = 'Recording...';
+    }
+}
+
+// Job Queue & Pipeline Tracker UI
+function renderJobQueue() {
+    const jobsContainer = document.getElementById('jobs-container');
+    const jobsList = document.getElementById('jobs-list');
+    const jobsCountBadge = document.getElementById('jobs-count-badge');
+
+    if (!jobsContainer || !jobsList || !jobsCountBadge) return;
+
+    if (trackedJobs.length === 0) {
+        jobsContainer.classList.add('hidden');
+        return;
+    }
+
+    jobsContainer.classList.remove('hidden');
+    const activeCount = trackedJobs.filter(j => j.status !== 'completed' && j.status !== 'failed').length;
+    jobsCountBadge.innerText = activeCount > 0 ? `${activeCount} processing` : `${trackedJobs.length} total`;
+
+    jobsList.innerHTML = '';
+
+    // Render jobs in reverse order (newest first)
+    [...trackedJobs].reverse().forEach((job) => {
+        const card = document.createElement('div');
+        const isCompleted = job.status === 'completed';
+        const isFailed = job.status === 'failed';
+        card.className = `job-card ${isCompleted ? 'completed' : isFailed ? 'failed' : 'active-job'}`;
+
+        const currentStageIdx =
+            job.status === 'completed' ? 4 :
+            job.status === 'duplicating' ? 4 :
+            job.status === 'diarizing_llm' ? 3 :
+            job.status === 'transcribing_groq' ? 2 : 1;
+
+        const stepsHtml = `
+            <div class="pipeline-steps">
+                <span class="pipeline-step ${currentStageIdx > 1 ? 'done' : currentStageIdx === 1 ? 'active' : ''}">📦 Prep</span>
+                <span class="pipeline-step ${currentStageIdx > 2 ? 'done' : currentStageIdx === 2 ? 'active' : ''}">🎙️ Groq STT</span>
+                <span class="pipeline-step ${currentStageIdx > 3 ? 'done' : currentStageIdx === 3 ? 'active' : ''}">🧠 Diarize</span>
+                <span class="pipeline-step ${currentStageIdx >= 4 ? (isFailed ? 'failed' : 'done') : ''}">✅ Done</span>
+            </div>
+        `;
+
+        card.innerHTML = `
+            <div class="job-top-row">
+                <span class="job-title">🎙️ ${job.recordingName || 'Audio Recording'}</span>
+                <span class="job-status-pill">${isCompleted ? 'Ready' : isFailed ? 'Error' : (job.progress || 10) + '%'}</span>
+            </div>
+            <div class="job-stage-desc">${job.stage_label || 'Processing...'}</div>
+            ${!isCompleted && !isFailed ? `
+                <div class="job-progress-bg">
+                    <div class="job-progress-fill" style="width: ${job.progress || 10}%"></div>
+                </div>
+            ` : ''}
+            ${stepsHtml}
+        `;
+
+        card.addEventListener('click', () => {
+            if (isCompleted && job.result) {
+                currentTranscript = job.result.formatted_text || job.result.raw_text || '';
+                transcriptBox.innerText = currentTranscript;
+                showScreen(screenResult);
+            } else if (isFailed) {
+                alert(`Job error: ${job.error || 'Processing failed'}`);
+            }
+        });
+
+        jobsList.appendChild(card);
+    });
+}
+
+function startPollingTasks() {
+    if (pollingIntervalId) return;
+    pollingIntervalId = setInterval(pollTaskStatuses, 1500);
+}
+
+function stopPollingTasks() {
+    if (pollingIntervalId) {
+        clearInterval(pollingIntervalId);
+        pollingIntervalId = null;
+    }
+}
+
+async function pollTaskStatuses() {
+    const activeJobs = trackedJobs.filter(j => j.status !== 'completed' && j.status !== 'failed');
+    if (activeJobs.length === 0) {
+        stopPollingTasks();
+        return;
+    }
+
+    for (const job of activeJobs) {
+        try {
+            const res = await fetch(`${API_BASE_URL}/api/tma/tasks/${job.task_id}`);
+            if (res.ok) {
+                const data = await res.json();
+                job.status = data.status;
+                job.stage_label = data.stage_label;
+                job.progress = data.progress;
+                job.result = data.result;
+                job.error = data.error;
+            }
+        } catch (err) {
+            console.warn('Task status poll error:', err);
+        }
+    }
+
+    renderJobQueue();
+}
+
+// Stop Recording (Non-blocking: immediately resets UI to allow next dictation!)
+async function stopRecording() {
+    if (!mediaRecorder) return;
+
+    recordingCounter += 1;
+    const recName = `Rec #${recordingCounter}`;
+
+    stopTimer();
+    statusText.innerText = 'Ready to record';
+
+    mediaRecorder.stop();
+
+    btnRecord.classList.remove('recording');
+    if (recordCore) recordCore.classList.remove('hidden');
+    iconPause.classList.add('hidden');
+    iconPlay.classList.add('hidden');
+    btnStop.classList.add('hidden');
+    statusBadge.className = 'status-badge';
+
+    resetTimer();
+    showScreen(screenRecorder); // Stay on recorder screen so user can record again immediately!
+
+    // Collect audio blob and launch async background task
+    setTimeout(async () => {
+        const audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+        await uploadAndTranscribeAsync(audioBlob, recName);
+    }, 400);
+}
+
+// Helper to extract Telegram WebApp User Context
+function getTelegramUserContext() {
+    const tgUser = window.Telegram?.WebApp?.initDataUnsafe?.user?.id;
+    const devUser = urlParams.get('dev_user_id') || urlParams.get('user_id');
+    const userId = tgUser || devUser || '';
+    const initData = window.Telegram?.WebApp?.initData || '';
+    return { userId, initData };
+}
+
+// API Calls
+async function uploadAndTranscribeAsync(blob, recordingName) {
+    const { userId, initData } = getTelegramUserContext();
+    const formData = new FormData();
+    formData.append('file', blob, 'recording.webm');
+    if (userId) formData.append('user_id', userId);
+    if (initData) formData.append('init_data', initData);
+
+    try {
+        const res = await fetch(`${API_BASE_URL}/api/tma/transcribe-async`, {
+            method: 'POST',
+            body: formData
+        });
+
+        const data = await res.json().catch(() => null);
+
+        if (!res.ok) {
+            throw new Error(data?.detail || `Server error (${res.status})`);
+        }
+
+        if (!data || !data.task_id) {
+            throw new Error("Invalid response from async transcribe API.");
+        }
+
+        const newJob = {
+            task_id: data.task_id,
+            recordingName: recordingName,
+            status: data.status || 'queued',
+            stage_label: data.stage_label || 'Queued...',
+            progress: data.progress || 10,
+            result: null,
+            error: null
+        };
+
+        trackedJobs.push(newJob);
+        renderJobQueue();
+        startPollingTasks();
+
+    } catch (err) {
+        console.error('Async upload failed:', err);
+        trackedJobs.push({
+            task_id: 'err_' + Date.now(),
+            recordingName: recordingName,
+            status: 'failed',
+            stage_label: 'Upload failed',
+            progress: 100,
+            error: err.message
+        });
+        renderJobQueue();
+    }
+}
+
+async function uploadAndTranscribe(blob) {
+    return uploadAndTranscribeAsync(blob, 'Recording');
+}
+
+
+async function requestSummary() {
+    if (!currentTranscript) return;
+
+    aiCard.classList.remove('hidden');
+    aiCardTitle.innerText = '📝 Summary';
+    aiCardBody.innerText = 'Generating summary...';
+
+    const { userId, initData } = getTelegramUserContext();
+    const payload = { text: currentTranscript };
+    if (userId) payload.user_id = userId;
+    if (initData) payload.init_data = initData;
+
+    try {
+        const res = await fetch(`${API_BASE_URL}/api/tma/summary`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        const data = await res.json().catch(() => null);
+
+        if (!res.ok) {
+            throw new Error(data?.detail || `Server error (${res.status})`);
+        }
+
+        aiCardBody.innerText = data?.summary || "No summary returned.";
+    } catch (err) {
+        aiCardBody.innerText = err.message;
+    }
+}
+
+async function sendCustomQuestion() {
+    const q = inputCustomQuestion.value.trim();
+    if (!q || !currentTranscript) return;
+
+    questionModal.classList.add('hidden');
+    aiCard.classList.remove('hidden');
+    aiCardTitle.innerText = `❓ Question: "${q}"`;
+    aiCardBody.innerText = 'Thinking...';
+
+    const { userId, initData } = getTelegramUserContext();
+    const payload = { text: currentTranscript, question: q };
+    if (userId) payload.user_id = userId;
+    if (initData) payload.init_data = initData;
+
+    try {
+        const res = await fetch(`${API_BASE_URL}/api/tma/custom-question`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        const data = await res.json().catch(() => null);
+
+        if (!res.ok) {
+            throw new Error(data?.detail || `Server error (${res.status})`);
+        }
+
+        aiCardBody.innerText = data?.answer || "No answer returned.";
+        inputCustomQuestion.value = '';
+    } catch (err) {
+        aiCardBody.innerText = err.message;
+    }
+}
+
+// Event Listeners
+btnRecord.addEventListener('click', () => {
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        togglePause();
+        return;
+    }
+    resetTimer();
+    startRecording();
+});
+
+btnStop.addEventListener('click', stopRecording);
+
+btnBack.addEventListener('click', () => {
+    resetTimer();
+    statusBadge.className = 'status-badge';
+    statusText.innerText = 'Ready to record';
+    aiCard.classList.add('hidden');
+    questionModal.classList.add('hidden');
+    showScreen(screenRecorder);
+});
+
+btnCopy.addEventListener('click', () => {
+    if (currentTranscript) {
+        navigator.clipboard.writeText(currentTranscript);
+        if (tg?.HapticFeedback) {
+            tg.HapticFeedback.notificationOccurred('success');
+        }
+        btnCopy.innerText = 'Copied!';
+        setTimeout(() => { btnCopy.innerText = 'Copy'; }, 2000);
+    }
+});
+
+btnSummary.addEventListener('click', requestSummary);
+
+btnCustomQ.addEventListener('click', () => {
+    questionModal.classList.remove('hidden');
+    inputCustomQuestion.focus();
+});
+
+btnCancelQ.addEventListener('click', () => {
+    questionModal.classList.add('hidden');
+});
+
+btnSendQ.addEventListener('click', sendCustomQuestion);
+
+btnCloseAi.addEventListener('click', () => {
+    aiCard.classList.add('hidden');
+});
+
+// Initialize visualizer loop and window resize handler
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+drawWaveform();

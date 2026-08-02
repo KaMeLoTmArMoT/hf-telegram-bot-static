@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Voice Recorder & AI Assistant</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <link rel="stylesheet" href="./styles.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-container">
+        <!-- RECORDER SCREEN -->
+        <section id="recorder-screen" class="screen active">
+            <header class="header">
+                <div class="status-badge" id="status-badge">
+                    <span class="status-dot"></span>
+                    <span id="status-text">Ready to record</span>
+                </div>
+            </header>
+
+            <main class="recorder-main">
+                <div class="timer-display" id="timer-display">00:00</div>
+
+                <div class="visualizer-container">
+                    <canvas id="waveform-canvas"></canvas>
+                </div>
+
+                <div class="controls-container">
+                    <button id="btn-record" class="btn btn-record" title="Start / Pause / Resume">
+                        <div id="record-core" class="record-core"></div>
+                        <svg id="icon-pause" width="28" height="28" viewBox="0 0 24 24" fill="var(--danger-color)" class="hidden">
+                            <rect x="6" y="4" width="4" height="16" rx="1"/>
+                            <rect x="14" y="4" width="4" height="16" rx="1"/>
+                        </svg>
+                        <svg id="icon-play" width="28" height="28" viewBox="0 0 24 24" fill="var(--danger-color)" class="hidden">
+                            <polygon points="5,3 19,12 5,21"/>
+                        </svg>
+                    </button>
+
+                    <button id="btn-stop" class="btn btn-primary btn-icon hidden" title="Finish & Transcribe">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                            <rect x="5" y="5" width="14" height="14" rx="2"/>
+                        </svg>
+                    </button>
+                </div>
+
+                <!-- ACTIVE & RECENT JOBS QUEUE -->
+                <div id="jobs-container" class="jobs-container hidden">
+                    <div class="jobs-header">
+                        <h4>⚡ Processing Queue</h4>
+                        <span id="jobs-count-badge" class="jobs-badge">0 active</span>
+                    </div>
+                    <div id="jobs-list" class="jobs-list">
+                        <!-- Job items dynamically rendered here -->
+                    </div>
+                </div>
+            </main>
+
+            <footer class="footer-hint">
+                <span>💡 Screen stays awake during recording</span>
+            </footer>
+        </section>
+
+        <!-- PROCESSING SCREEN -->
+        <section id="processing-screen" class="screen">
+            <div class="processing-card">
+                <div class="spinner"></div>
+                <h3 id="processing-title">Processing audio...</h3>
+                <p id="processing-subtitle">Groq Whisper transcribing and identifying speakers</p>
+            </div>
+        </section>
+
+        <!-- RESULT SCREEN -->
+        <section id="result-screen" class="screen">
+            <header class="header result-header">
+                <button id="btn-back" class="btn-text">← New Recording</button>
+                <h2>Transcript</h2>
+                <button id="btn-copy" class="btn-text">Copy</button>
+            </header>
+
+            <main class="result-main">
+                <div class="transcript-box" id="transcript-box">
+                    <!-- Text output -->
+                </div>
+
+                <div class="action-buttons">
+                    <button id="btn-summary" class="btn btn-action">
+                        <span>📝</span> Summary
+                    </button>
+                    <button id="btn-custom-q" class="btn btn-action">
+                        <span>❓</span> Custom Question
+                    </button>
+                </div>
+
+                <div id="ai-response-card" class="ai-card hidden">
+                    <div class="ai-card-header">
+                        <h4 id="ai-card-title">AI Analysis</h4>
+                        <button id="btn-close-ai" class="btn-close">&times;</button>
+                    </div>
+                    <div class="ai-card-body" id="ai-card-body">
+                        <!-- AI output -->
+                    </div>
+                </div>
+
+                <!-- Custom Question Modal/Container -->
+                <div id="question-modal" class="modal-card hidden">
+                    <h4>Ask a question about the conversation:</h4>
+                    <textarea id="input-custom-question" placeholder="e.g., What were the main agreements and deadlines?" rows="3"></textarea>
+                    <div class="modal-buttons">
+                        <button id="btn-cancel-q" class="btn btn-secondary">Cancel</button>
+                        <button id="btn-send-q" class="btn btn-primary">Ask AI</button>
+                    </div>
+                </div>
+            </main>
+        </section>
+    </div>
+
+    <script src="./app.js"></script>
+</body>
+</html>
